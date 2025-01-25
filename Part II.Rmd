@@ -1,5 +1,11 @@
+---
+title: "Prediction Challenge Part 2-Creation"
+author: Tu Nguyen
+date: Feb 2024
+output: github_document
+---
 
-
+install.packages("rmarkdown")
 
 
 ```{r}
