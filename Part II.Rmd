@@ -1,0 +1,361 @@
+
+
+
+
+```{r}
+# Load necessary libraries
+library(readr)
+library(dplyr)
+library(tidyr)
+library(caret)
+library(randomForest)
+
+# Load the dataset
+dataset <- read_csv("predictionChallenge.csv")
+c(colnames(dataset))
+```
+
+
+
+```{r}
+
+dataset <- dataset %>%
+  rename(
+    HostID = `host [id]`, 
+    Price = `Price($)`  
+
+  )
+```
+
+
+```{r}
+
+library(geosphere)
+
+# Calculate distance to Times Square
+dataset$DistanceToTimesSquare <- distHaversine(matrix(c(-73.9855, 40.7580), ncol = 2), dataset[, c('longitude', 'latitude')])
+
+
+
+dataset$last_review <- as.Date(dataset$last_review, format = "%Y-%m-%d")
+
+fixed_recent_date <- as.Date('2023-01-01') # Example fixed recent date
+dataset$DaysSinceLastReview <- as.numeric(fixed_recent_date - dataset$last_review, units = "days")
+
+dataset$Price[is.na(dataset$Price)] <- median(dataset$Price, na.rm = TRUE)
+dataset$`minimum nights`[is.na(dataset$`minimum nights`)] <- median(dataset$`minimum nights`, na.rm = TRUE)
+# Price per night per guest (assuming 'Price' is per night)
+dataset$PricePerNightPerGuest <- dataset$Price / dataset$`minimum nights`
+
+dataset$PricePerNightPerGuest[is.infinite(dataset$PricePerNightPerGuest)] <- median(dataset$PricePerNightPerGuest, na.rm = TRUE)
+dataset$PricePerNightPerGuest[is.na(dataset$PricePerNightPerGuest)] <- median(dataset$PricePerNightPerGuest, na.rm = TRUE)
+
+# Ensure all new variables are not NA. If they are, fill with median or appropriate value
+dataset$DistanceToTimesSquare[is.na(dataset$DistanceToTimesSquare)] <- median(dataset$DistanceToTimesSquare, na.rm = TRUE)
+dataset$DaysSinceLastReview[is.na(dataset$DaysSinceLastReview)] <- median(dataset$DaysSinceLastReview, na.rm = TRUE)
+dataset$PricePerNightPerGuest[is.na(dataset$PricePerNightPerGuest)] <- median(dataset$PricePerNightPerGuest, na.rm = TRUE)
+
+
+
+
+
+```
+
+
+
+```{r}
+
+
+dataset <- dataset %>%
+  mutate(PVI = Price / (floor + 1))
+
+
+dataset <- dataset %>%
+  mutate(DealQualityPredicted = case_when(
+    PVI < quantile(PVI, .25) & mean_review_score > 4.5 ~ "Prime Deal",
+    PVI >= quantile(PVI, .25) & PVI <= quantile(PVI, .75) ~ "Standard Deal",
+    TRUE ~ "Below Average"
+  ))
+
+
+
+```
+
+
+
+
+
+
+
+```{r}
+
+
+if("DaysSinceLastReview" %in% names(dataset)) {
+  dataset <- dataset[, !names(dataset) %in% "DaysSinceLastReview"]
+}
+
+# Split the dataset
+set.seed(123) # For reproducibility
+trainingIndex <- createDataPartition(dataset$DealQualityPredicted, p = .8, list = FALSE)
+trainingData <- dataset[trainingIndex, ]
+testingData <- dataset[-trainingIndex, ]
+
+
+
+# Prepare data for modeling
+trainX <- trainingData %>% select(-c(DealQualityPredicted, name, HostID, `host-name`, last_review)) %>% data.frame()
+trainY <- trainingData$DealQualityPredicted
+testX <- testingData %>% select(-c(DealQualityPredicted, name, HostID, `host-name`, last_review)) %>% data.frame()
+testY <- testingData$DealQualityPredicted
+
+
+# Convert the target variable to a factor for classification
+trainY <- as.factor(trainY)
+testY <- as.factor(testY)
+
+
+# Impute NA and NaN values with the median for each column
+trainX <- apply(trainX, 2, function(x) ifelse(is.na(x) | is.nan(x), median(x, na.rm = TRUE), x))
+
+
+# Convert trainX to a dataframe if it's not already
+trainX <- as.data.frame(trainX)
+
+# Check if trainX is a data frame or matrix
+if(!is.data.frame(trainX) && !is.matrix(trainX)) {
+  print("trainX is not a data frame or matrix.")
+}
+
+# Check if trainX is empty
+if(nrow(trainX) == 0 || ncol(trainX) == 0) {
+  print("trainX is empty.")
+}
+
+
+# Verify dataset structure
+str(dataset)
+
+# Check for any NULL columns in dataset that might affect trainX
+sapply(dataset, function(x) any(is.null(x)))
+
+
+if(is.null(trainX) || is.null(nrow(trainX)) || is.null(ncol(trainX))) {
+  print("trainX is NULL or its dimensions are not properly defined.")
+} else if(nrow(trainX) == 0 || ncol(trainX) == 0) {
+  print("trainX is empty.")
+}
+
+
+
+# Replace Inf values with the maximum non-Inf value of the column
+trainX <- apply(trainX, 2, function(x) ifelse(is.infinite(x), max(x[!is.infinite(x)], na.rm = TRUE), x))
+
+# Convert back to data frame if necessary
+trainX <- as.data.frame(trainX)
+
+
+# Check for NA values
+anyNA(trainX)
+
+
+# Ensure trainX is a dataframe
+trainX <- as.data.frame(trainX)
+
+
+# Impute NA and NaN values with the median for numeric columns
+for(col in names(trainX)) {
+  if(is.numeric(trainX[[col]])) {
+    trainX[[col]][is.na(trainX[[col]]) | is.nan(trainX[[col]])] <- median(trainX[[col]], na.rm = TRUE)
+  }
+}
+
+# Replace Inf values with the maximum non-Inf value for numeric columns
+for(col in names(trainX)) {
+  if(is.numeric(trainX[[col]])) {
+    infIndexes <- is.infinite(trainX[[col]])
+    if(any(infIndexes)) {
+      trainX[[col]][infIndexes] <- max(trainX[[col]][!infIndexes], na.rm = TRUE)
+    }
+  }
+}
+
+
+# Identify categorical variables
+categoricalVars <- sapply(trainX, is.factor)  # or use class(x) == "factor" for a more specific approach
+catVarNames <- names(categoricalVars[categoricalVars == TRUE])
+
+# Apply frequency encoding
+for(var in catVarNames) {
+  # Calculate frequencies
+  freqTable <- table(trainX[[var]])
+  
+  # Create a named vector for mapping
+  freqMap <- freqTable / sum(freqTable)
+  
+  # Apply mapping
+  trainX[[var]] <- as.numeric(freqMap[as.character(trainX[[var]])])
+}
+
+# Apply frequency encoding to test data using training data frequencies
+for(var in catVarNames) {
+  # Use the same freqTable from train data or recalculate if the test set has unique categories
+  freqTable <- table(trainX[[var]])  # Ideally, you should store freqTable from above and reuse it here
+  
+  # Create a named vector for mapping (reusing from training data)
+  freqMap <- freqTable / sum(freqTable)
+  
+  # Ensure test data categories are in freqMap, handle unseen categories
+  unseenCategories <- setdiff(unique(testX[[var]]), names(freqMap))
+  freqMap[unseenCategories] <- 0  # or some other logic for handling unseen categories
+  
+  # Apply mapping
+  testX[[var]] <- as.numeric(freqMap[as.character(testX[[var]])])
+}
+
+
+
+
+
+# Numeric columns: Impute NA with median
+numericCols <- sapply(trainX, is.numeric)
+trainX[, numericCols] <- lapply(trainX[, numericCols], function(x) ifelse(is.na(x), median(x, na.rm = TRUE), x))
+
+# Ensure there are no NAs left
+colSums(is.na(trainX))
+
+
+
+
+
+# Fit a Random Forest model
+rfModel <- randomForest(x = trainX, y = trainY, ntree = 500)
+
+
+numericalVars <- sapply(testX, is.numeric)
+
+# Impute missing values with the median from trainX
+for(var in names(numericalVars[numericalVars == TRUE])) {
+  if(any(is.na(testX[[var]]))) {
+    # Use median from trainX for consistency
+    medianValue <- median(trainX[[var]], na.rm = TRUE)
+    testX[[var]][is.na(testX[[var]])] <- medianValue
+  }
+}
+
+
+for(var in catVarNames) {
+  testX[[var]][is.na(testX[[var]])] <- 0  # Or another appropriate value
+}
+
+
+# Predict
+predictions <- predict(rfModel, testX)
+
+# Evaluate
+confusionMatrix(predictions, testY)
+
+
+
+```
+
+
+
+```{r}
+
+
+
+library(caret)
+library(DMwR)  # For SMOTE
+library(randomForest)
+
+```
+
+
+```{r}
+
+
+
+combined_data <- cbind(trainX, DealQuality = trainY)
+
+# Apply SMOTE
+balanced_data <- SMOTE(DealQuality ~ ., data = combined_data, perc.over = 1000, k = 100)
+
+trainX_balanced <- balanced_data[, names(balanced_data) != "DealQuality"]
+trainY_balanced <- balanced_data$DealQuality
+
+
+
+```
+
+```{r}
+
+
+
+rfModel <- randomForest(x = trainX_balanced, y = trainY_balanced, ntree = 1, nodesize = 2)
+
+# Predict
+predictions <- predict(rfModel, trainX_balanced)
+
+# Evaluate
+confusionMatrix(predictions, trainY_balanced)
+
+# Predict
+predictions <- predict(rfModel, testX)
+
+# Evaluate
+confusionMatrix(predictions, testY)
+
+```
+
+
+```{r}
+
+
+
+library(gbm)
+gbm_model <- gbm(formula = trainY_balanced ~ ., data = trainX_balanced, distribution = "multinomial", n.trees = 500, interaction.depth = 3)
+
+
+
+```
+
+
+
+```{r}
+
+
+# Predict
+predictions <- predict(gbm_model, trainX_balanced, n.trees = 500, type = "response")
+
+
+predictions <- apply(predictions, 1, which.max)
+
+labels <- c("Below Average", "Prime Deal", "Standard Deal")
+
+# Replace numeric predictions with corresponding labels
+predictions <- factor(predictions, levels = 1:3, labels = labels)
+
+
+
+# Evaluate
+confusionMatrix(predictions, trainY_balanced)
+
+# Predict
+predictions <- predict(gbm_model, testX, n.trees = 500, type = "response")
+
+
+predictions <- apply(predictions, 1, which.max)
+
+labels <- c("Below Average", "Prime Deal", "Standard Deal")
+
+# Replace numeric predictions with corresponding labels
+predictions <- factor(predictions, levels = 1:3, labels = labels)
+
+
+
+# Evaluate
+confusionMatrix(predictions, testY)
+
+
+
+```
